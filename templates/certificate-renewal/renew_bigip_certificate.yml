@@ -1,0 +1,230 @@
+---
+- name: BIG-IP certificate renewal via ACME v2 (DigiCert)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  collections:
+    - f5networks.f5_modules
+    - community.crypto
+
+  vars:
+    # BIG-IP connection
+    provider:
+      server: "{{ bigip_host }}"
+      user: "{{ bigip_username }}"
+      password: "{{ bigip_password }}"
+      server_port: {{ bigip_port | default(443) }}
+      validate_certs: {{ bigip_validate_certs | default(false) }}
+
+    # ACME v2 (DigiCert) settings
+    acme_directory: "{{ digicert_acme_directory }}"
+    acme_account_key_src: "{{ acme_account_key_path }}"
+    acme_challenge: "{{ acme_challenge_type | default('dns-01') }}"
+    acme_validate_certs: {{ acme_validate_directory_certs | default(true) }}
+
+    # Challenge handling mode:
+    # - issue: fail with challenge instructions when challenge_data is present
+    # - finalize: complete order using prior order/challenge payload
+    acme_mode: "{{ acme_order_mode | default('issue') }}"
+    acme_order_data_path: "{{ prior_acme_order_data_path | default(work_dir ~ '/' ~ cert_common_name ~ '-order-data.json') }}"
+
+    # Certificate request settings
+    cert_common_name: "{{ certificate_common_name }}"
+    cert_sans: "{{ certificate_sans | default([]) }}"
+
+    # Local workspace/output files
+    work_dir: "{{ acme_work_dir | default('./artifacts/acme') }}"
+    domain_key_src: "{{ domain_private_key_path | default(work_dir ~ '/' ~ cert_common_name ~ '.key') }}"
+    csr_src: "{{ csr_path | default(work_dir ~ '/' ~ cert_common_name ~ '.csr') }}"
+    cert_out: "{{ issued_cert_path | default(work_dir ~ '/' ~ cert_common_name ~ '.crt') }}"
+    chain_out: "{{ issued_chain_path | default(work_dir ~ '/' ~ cert_common_name ~ '-chain.crt') }}"
+    fullchain_out: "{{ issued_fullchain_path | default(work_dir ~ '/' ~ cert_common_name ~ '-fullchain.crt') }}"
+
+    # BIG-IP objects
+    partition: "{{ target_partition | default('Common') }}"
+    cert_name: "{{ target_cert_name }}"
+    key_name: "{{ target_key_name | default(target_cert_name) }}"
+    chain_name: "{{ target_chain_name | default(target_cert_name ~ '-chain') }}"
+    clientssl_profile: "{{ target_clientssl_profile }}"
+    sni_default: "{{ set_sni_default | default(true) }}"
+
+  tasks:
+    - name: Validate mandatory inputs
+      ansible.builtin.assert:
+        that:
+          - bigip_host | length > 0
+          - bigip_username | length > 0
+          - bigip_password | length > 0
+          - digicert_acme_directory | length > 0
+          - acme_account_key_path | length > 0
+          - certificate_common_name | length > 0
+          - target_cert_name | length > 0
+          - target_clientssl_profile | length > 0
+          - acme_mode in ['issue', 'finalize']
+        fail_msg: "Missing/invalid required variables. See README for DigiCert ACME v2 flow."
+
+    - name: Ensure workspace exists
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Ensure domain private key exists
+      community.crypto.openssl_privatekey:
+        path: "{{ domain_key_src }}"
+        type: RSA
+        size: 2048
+        mode: '0600'
+
+    - name: Build SAN list for CSR
+      ansible.builtin.set_fact:
+        csr_subject_alt_name: >-
+          {{
+            ([cert_common_name] + cert_sans)
+            | unique
+            | map('regex_replace', '^(.*)$', 'DNS:\\1')
+            | list
+          }}
+
+    - name: Generate CSR
+      community.crypto.openssl_csr:
+        path: "{{ csr_src }}"
+        privatekey_path: "{{ domain_key_src }}"
+        common_name: "{{ cert_common_name }}"
+        subject_alt_name: "{{ csr_subject_alt_name }}"
+        mode: '0644'
+
+    - name: Start ACME order with DigiCert ACME v2 (issue mode)
+      when: acme_mode == 'issue'
+      community.crypto.acme_certificate:
+        account_key_src: "{{ acme_account_key_src }}"
+        acme_directory: "{{ acme_directory }}"
+        validate_certs: {{ acme_validate_certs }}
+        challenge: "{{ acme_challenge }}"
+        csr: "{{ csr_src }}"
+        cert_dest: "{{ cert_out }}"
+        chain_dest: "{{ chain_out }}"
+        fullchain_dest: "{{ fullchain_out }}"
+        terms_agreed: true
+      register: acme_issue
+      no_log: true
+
+    - name: Persist ACME order/challenge payload for finalize step
+      when:
+        - acme_mode == 'issue'
+        - acme_issue.challenge_data is defined
+        - acme_issue.challenge_data | length > 0
+      ansible.builtin.copy:
+        dest: "{{ acme_order_data_path }}"
+        mode: '0600'
+        content: >-
+          {{
+            {
+              'order_uri': acme_issue.order_uri,
+              'challenge_data': acme_issue.challenge_data,
+              'challenge_data_dns': acme_issue.challenge_data_dns | default({})
+            } | to_nice_json
+          }}
+
+    - name: Stop after issuing challenge details (complete DNS challenge and rerun in finalize mode)
+      when:
+        - acme_mode == 'issue'
+        - acme_issue.challenge_data is defined
+        - acme_issue.challenge_data | length > 0
+      ansible.builtin.fail:
+        msg: >-
+          ACME challenge created. Complete required challenge validation, then rerun with
+          acme_order_mode=finalize and prior_acme_order_data_path={{ acme_order_data_path }}.
+
+    - name: Read prior ACME order payload (finalize mode)
+      when: acme_mode == 'finalize'
+      ansible.builtin.slurp:
+        src: "{{ acme_order_data_path }}"
+      register: prior_acme_payload_raw
+
+    - name: Parse prior ACME order payload (finalize mode)
+      when: acme_mode == 'finalize'
+      ansible.builtin.set_fact:
+        prior_acme_payload: "{{ prior_acme_payload_raw.content | b64decode | from_json }}"
+
+    - name: Finalize ACME order and download certs
+      when: acme_mode == 'finalize'
+      community.crypto.acme_certificate:
+        account_key_src: "{{ acme_account_key_src }}"
+        acme_directory: "{{ acme_directory }}"
+        validate_certs: {{ acme_validate_certs }}
+        challenge: "{{ acme_challenge }}"
+        csr: "{{ csr_src }}"
+        cert_dest: "{{ cert_out }}"
+        chain_dest: "{{ chain_out }}"
+        fullchain_dest: "{{ fullchain_out }}"
+        terms_agreed: true
+        order_uri: "{{ prior_acme_payload.order_uri }}"
+        data: "{{ prior_acme_payload.challenge_data }}"
+      register: acme_finalize
+      no_log: true
+
+    - name: Check issued certificate exists
+      ansible.builtin.stat:
+        path: "{{ cert_out }}"
+      register: cert_stat
+
+    - name: Check issued chain exists
+      ansible.builtin.stat:
+        path: "{{ chain_out }}"
+      register: chain_stat
+
+    - name: Ensure issuance artifacts exist before BIG-IP upload
+      ansible.builtin.assert:
+        that:
+          - cert_stat.stat.exists
+          - chain_stat.stat.exists
+        fail_msg: "Certificate issuance artifacts not found. Complete ACME flow before BIG-IP deployment."
+
+    - name: Upload renewed certificate and key to BIG-IP
+      f5networks.f5_modules.bigip_ssl_key_cert:
+        provider: "{{ provider }}"
+        partition: "{{ partition }}"
+        cert_name: "{{ cert_name }}"
+        key_name: "{{ key_name }}"
+        cert_content: "{{ lookup('ansible.builtin.file', cert_out) }}"
+        key_content: "{{ lookup('ansible.builtin.file', domain_key_src) }}"
+        state: present
+      no_log: true
+
+    - name: Upload chain certificate to BIG-IP
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider: "{{ provider }}"
+        partition: "{{ partition }}"
+        name: "{{ chain_name }}"
+        content: "{{ lookup('ansible.builtin.file', chain_out) }}"
+        state: present
+      no_log: true
+
+    - name: Update client SSL profile cert-key-chain
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider: "{{ provider }}"
+        partition: "{{ partition }}"
+        name: "{{ clientssl_profile }}"
+        cert_key_chain:
+          - cert: "{{ cert_name }}"
+            key: "{{ key_name }}"
+            chain: "{{ chain_name }}"
+            sni_default: "{{ sni_default }}"
+        state: present
+
+    - name: Save BIG-IP config
+      f5networks.f5_modules.bigip_config:
+        provider: "{{ provider }}"
+        save: true
+
+    - name: Gather certificate details for confirmation
+      f5networks.f5_modules.bigip_command:
+        provider: "{{ provider }}"
+        commands:
+          - "list sys file ssl-cert /{{ partition }}/{{ cert_name }} expiration-string"
+      register: cert_check
+
+    - name: Show renewed certificate expiration on BIG-IP
+      ansible.builtin.debug:
+        var: cert_check.stdout_lines
